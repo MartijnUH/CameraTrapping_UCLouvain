@@ -1,0 +1,478 @@
+---
+title: "CT_case_study_UCLouvain"
+author: "Martijn"
+date: "2024-11-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r install and load required libraries}
+# installation of latest version of required packages
+install.packages("dplyr")
+install.packages("devtools")
+devtools::install_github("inbo/camtraptor")
+
+# loading the libraries
+library(camtrapDensity)
+library(camtraptor)
+library(camtrapR)
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(forcats)
+library(stringr)
+library(lubridate)
+library(activity)
+library(overlap)
+library(unmarked)
+library(ggplot2)
+library(sf)
+library(MuMIn)
+library(AICcmodavg)
+source("Functions.R")
+```
+
+```{r importing and pre-processing of CT data}
+## Import + pre-process camera trap data
+# import the data
+GMU8 <- read_rds("CT_data.rds")
+
+# create a record table
+rec_table <- get_record_table(
+  GMU8,
+  stationCol = "locationName",
+  exclude = NULL,
+  minDeltaTime = 30,
+  deltaTimeComparedTo = "lastIndependentRecord"
+)
+my_species <- unique(rec_table$Species)
+species_table <- distinct(GMU8$data$observations, scientificName, vernacularNames.eng)
+name_converter <- species_table$vernacularNames.eng
+names(name_converter) <- species_table$scientificName
+n <- length(my_species)
+
+# append radian clock and solar times
+coords <- get_coordinates(GMU8)
+rec_table <- append_activity_data(rec_table, coords)
+```
+
+```{r activity}
+## Activity patterns
+rec_table_species <- split(rec_table, rec_table$Species)
+f_acts_clock <- f_acts_solar <- list()
+
+# calculate activity
+for (i in 1:n) {
+  # using clock times
+  f_acts_clock[[i]] <- fitact(
+    rec_table_species[[i]]$clock, reps = 20, sample = "data")  
+  # using solar times
+  f_acts_solar[[i]] <- fitact(
+    rec_table_species[[i]]$solar, reps = 20, sample = "data")  
+}
+names(f_acts_clock) <- names(f_acts_solar) <- my_species
+
+# compare % of diel activity
+compareAct(f_acts_clock)
+compareAct(f_acts_solar)
+
+# plot activity pattern using base R
+plot(f_acts_clock$`Capreolus capreolus`)
+plot(f_acts_clock$`Sus scrofa`)
+plot(f_acts_clock$`Vulpes vulpes`)
+
+# plot activity pattern using ggplot2
+get_pdf <- function(fitact) {as_tibble(fitact@pdf)}
+acts_clock <- lapply(f_acts_clock, get_pdf)
+acts_solar <- lapply(f_acts_solar, get_pdf)
+
+actplot_ss(acts_clock$`Capreolus capreolus`, xlabels = "clock") + 
+  ggtitle("Activity - roe deer")
+actplot_ss(acts_clock$`Sus scrofa`, xlabels = "clock") + 
+  ggtitle("Activity - wild boar") 
+actplot_ss(acts_clock$`Vulpes vulpes`, xlabels = "clock") + 
+  ggtitle("Activity - wild boar") 
+
+actplot_ss(acts_solar$`Capreolus capreolus`, xlabels = "solar") + 
+  ggtitle("Activity - roe deer")
+actplot_ss(acts_solar$`Sus scrofa`, xlabels = "solar") + 
+  ggtitle("Activity - wild boar") 
+actplot_ss(acts_solar$`Vulpes vulpes`, xlabels = "solar") + 
+  ggtitle("Activity - wild boar") 
+
+actplot_ms(rbindlist(acts_clock, idcol = "species") %>%
+             mutate(species = name_converter[species]), xlabels = "solar") 
+  # + theme(
+  #   axis.title = element_text(size = 14),
+  #   axis.text.y = element_text(size = 11),
+  #   axis.text.x = element_text(size = 13),
+  #   legend.title = element_text(size = 13),
+  #   legend.text = element_text(size = 13))
+
+# ggsave("Figures/activity.png", width = 16, height = 12, units = "cm", dpi = 300)
+
+# calculate coefficient of overlap
+ovl4(f_acts_solar$`Capreolus capreolus`, f_acts_solar$`Sus scrofa`)
+ovl4(f_acts_solar$`Capreolus capreolus`, f_acts_solar$`Vulpes vulpes`)
+ovl4(f_acts_solar$`Sus scrofa`, f_acts_solar$`Vulpes vulpes`)
+
+```
+
+```{r occupancy}
+## Occupancy
+# get the camera operation matrix
+camop <- get_cam_op(GMU8, station_col = "locationName")
+R <- nrow(camop); J <- 25
+
+# get the detection histories
+dethist <- list()
+for (i in 1:n) {
+  dethist[[i]] <- detectionHistory(
+    recordTable = rec_table,
+    species = my_species[i],
+    camOp = camop,
+    output = "binary", # use counts for 'abundance' models
+    occasionLength = 1,
+    includeEffort = F,
+    scaleEffort = F,
+    maxNumberDays = J,
+    timeZone = "CET",
+    day1 = "station",
+    recordDateTimeCol = "DateTimeOriginal",
+    recordDateTimeFormat = "%Y-%m-%d %H:%M:%S")
+  
+  dethist[[i]] <- dethist[[i]]$detection_history[,1:J]
+}
+names(dethist) <- my_species
+
+# create the unmarkedFrame object
+umf <- lapply(dethist, unmarkedFrameOccu)
+
+# fit single-season occupancy model without covariates
+f_occu <- list()
+
+for (i in 1:n) {
+  f_occu[[i]] <- occu(~1~1, umf[[i]])
+}
+names(f_occu) <- my_species
+
+# inspect the summaries of the occupancy fits
+summary(f_occu$`Capreolus capreolus`)
+summary(f_occu$`Sus scrofa`)
+summary(f_occu$`Vulpes vulpes`)
+
+# calculate the expected occupancy
+backTransform(f_occu$`Capreolus capreolus`, type = "state")
+backTransform(f_occu$`Sus scrofa`, type = "state")
+backTransform(f_occu$`Vulpes vulpes`, type = "state")
+
+get_mean_ci <- function(x, type) { 
+  c(coef(x, type = type), confint(x, type = type))
+}
+
+# extract the detection parameter estimates (mean + 95% CI)
+dets <- as.data.frame(
+  cbind(my_species,
+        rbind.data.frame(
+          plogis(get_mean_ci(f_occu$`Capreolus capreolus`, type = "det")),
+          plogis(get_mean_ci(f_occu$`Sus scrofa`, type = "det")),
+          plogis(get_mean_ci(f_occu$`Vulpes vulpes`, type = "det"))
+        )
+  ))
+
+colnames(dets) <- c("species", "mean", "0.025", "0.975")
+
+# Plot detection probability
+dets %>% mutate(species = name_converter[species]) %>%
+  ggplot(aes(x = species, col = species, y = mean, ymin = `0.025`, ymax = `0.975`)) + 
+  geom_point() + geom_errorbar() + 
+  ylab("Detection probability") +
+  ylim(0, 1) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.title = element_text(size = 14),
+    axis.text.y = element_text(size = 11),
+    axis.text.x = element_text(size = 13),
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 13))
+
+# ggsave("Figures/detection.png", width = 16, height = 12, units = "cm", dpi = 300)
+
+# extract the occupancy parameter estimates (mean + 95% CI)
+occs <- as.data.frame(
+  cbind(my_species,
+    rbind.data.frame(
+    plogis(get_mean_ci(f_occu$`Capreolus capreolus`, type = "state")),
+    plogis(get_mean_ci(f_occu$`Sus scrofa`, type = "state")),
+    plogis(get_mean_ci(f_occu$`Vulpes vulpes`, type = "state"))
+  )
+))
+
+colnames(occs) <- c("species", "mean", "0.025", "0.975")
+
+# plot occupancy
+occs %>% mutate(species = name_converter[species]) %>%
+ggplot(aes(x = species, col = species, y = mean, ymin = `0.025`, ymax = `0.975`)) + 
+  geom_point() + geom_errorbar() + 
+  ylab("Occupancy probability") +
+  ylim(0, 1) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.title = element_text(size = 14),
+    axis.text.y = element_text(size = 11),
+    axis.text.x = element_text(size = 13),
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 13))
+
+# ggsave("Figures/occupancy.png", width = 16, height = 12, units = "cm", dpi = 300)
+```
+
+```{r import grid shapefile and corine land cover map}
+# read grid layer
+grid <- st_read("Grid/sample_grid.shp")
+
+# read Corine Land Cover data
+clc <- st_read("CLC/clc2018_meerdaal.shp")
+clc <- st_transform(clc, st_crs(grid))
+clc <- clc %>% rename(code3 = CODE_18) %>% 
+  mutate(code2 = substring(code3, 1, 2), code1 = substring(code3, 1, 1)) %>%
+  select(ID, AREA_HA, Remark, code1:code3)
+
+# define color scale
+clc_colors <- c(
+  "111" = "#e6004d",  # Continuous urban fabric
+  "112" = "#ff0000",  # Discontinuous urban fabric
+  "121" = "#cc4df2",  # Industrial or commercial units
+  "122" = "#cc0000",  # Road and rail networks and associated land
+  "123" = "#e6cccc",  # Port areas
+  "124" = "#e6cce6",  # Airports
+  "131" = "#a600cc",  # Mineral extraction sites
+  "132" = "#a64d00",  # Dump sites
+  "133" = "#ff4dff",  # Construction sites
+  "141" = "#ffa6ff",  # Green urban areas
+  "142" = "#ffe6ff",  # Sport and leisure facilities
+  "211" = "#ffffa8",  # Non-irrigated arable land
+  "212" = "#ffff00",  # Permanently irrigated land
+  "213" = "#e6e600",  # Rice fields
+  "221" = "#e68000",  # Vineyards
+  "222" = "#f2a64d",  # Fruit trees and berry plantations
+  "223" = "#e6a600",  # Olive groves
+  "231" = "#e6e64d",  # Pastures
+  "241" = "#ffe6a6",  # Annual crops associated with permanent crops
+  "242" = "#ffe64d",  # Complex cultivation patterns
+  "243" = "#e6cc4d",  # Land principally occupied by agriculture with significant areas of natural vegetation
+  "244" = "#f2cca6",  # Agro-forestry areas
+  "311" = "#80ff00",  # Broad-leaved forest
+  "312" = "#00a600",  # Coniferous forest
+  "313" = "#4dff00",  # Mixed forest
+  "321" = "#ccf24d",  # Natural grasslands
+  "322" = "#a6ff80",  # Moors and heathland
+  "323" = "#a6e64d",  # Sclerophyllous vegetation
+  "324" = "#a6f200",  # Transitional woodland-shrub
+  "331" = "#e6e6e6",  # Beaches - dunes - sands
+  "332" = "#cccccc",  # Bare rocks
+  "333" = "#ccffcc",  # Sparsely vegetated areas
+  "334" = "#000000",  # Burnt areas
+  "335" = "#a6e6cc",  # Glaciers and perpetual snow
+  "411" = "#a6a6ff",  # Inland marshes
+  "412" = "#4d4dff",  # Peat bogs
+  "421" = "#ccccff",  # Salt marshes
+  "422" = "#e6e6ff",  # Salines
+  "423" = "#a6a6e6",  # Intertidal flats
+  "511" = "#00ccf2",  # Water courses
+  "512" = "#80f2e6",  # Water bodies
+  "521" = "#00ffa6",  # Coastal lagoons
+  "522" = "#a6ffe6",  # Estuaries
+  "523" = "#e6f2ff",  # Sea and ocean
+  "999" = "#ffffff"   # NODATA
+)
+```
+
+```{r prepare site and observation covariates}
+# calculate min. Euclidean distance to major CLC land classes
+dist_clc1 <- do.call("cbind.data.frame", lapply(1:5, function (i) {
+  apply(st_distance(grid, filter(clc, code1 == i)), 1, min)
+}))
+names(dist_clc1) <- paste0("dist_", c("urban", "agri", "forest", "wetl", "water"))
+
+# distance to specific CLC land classes, e.g. broadleaved forest
+dist_broadlv <- apply(st_distance(grid, filter(clc, code3 == 313)), 1, min)
+
+# calculate the dominant land class per grid cell
+habitat <- st_intersection(grid, clc) %>%
+  mutate(area = st_area(.)) %>%
+  st_drop_geometry() %>%
+  group_by(Id) %>%
+  summarize(code1 = code1[which.max(area)],
+            code2 = code2[which.max(area)],
+            code3 = code3[which.max(area)])
+
+# calculate the percentage of each land class per grid cell
+grid_area <- st_area(grid)[1]
+pct_clc1 <- st_intersection(grid, clc) %>%
+  mutate(area = st_area(.)) %>%
+  st_drop_geometry() %>%
+  group_by(Id, code1) %>%
+  summarise(area = sum(area)) %>%
+  mutate(pct = as.numeric(area/grid_area)) %>%
+  pivot_wider(id_cols = Id, names_from = code1, values_from = pct, 
+              names_prefix = "pct") %>%
+  mutate(pct4 = NA) %>%
+  replace(is.na(.), 0) %>%
+  select(Id, pct1, pct2, pct3, pct4, pct5)
+names(pct_clc1)[-1] <- paste0("pct_", c("urban", "agri", "forest", "wetl", "water"))
+
+# percentage of a specific CLC land classes, e.g. broadleaved forest
+pct_broadlv <- st_intersection(grid, clc) %>%
+  mutate(area = st_area(.)) %>%
+  st_drop_geometry() %>%
+  group_by(Id, code3) %>%
+  summarise(area = sum(area)) %>%
+  mutate(pct = as.numeric(area/grid_area)) %>%
+  pivot_wider(id_cols = Id, names_from = code3, values_from = pct, 
+              names_prefix = "pct") %>%
+  replace(is.na(.), 0) %>%
+  pull(pct311)
+
+# combine sitecovs
+sitecovs <- 
+  cbind(pct_clc1, dist_clc1, pct_broadlv = pct_broadlv,
+        dist_broadlv = dist_broadlv, habitat[,-1])
+
+# construct obscovs
+obscovs <- list(
+  date = do.call("rbind", lapply(1:nrow(camop), function(i) {
+    colnames(camop)[!is.na(camop[i,])][1:25] })))
+obscovs$jul = matrix(julian(as.Date(obscovs$date)), nrow = R, ncol = J)
+obscovs$doy = matrix(yday(as.Date(obscovs$date)), nrow = R, ncol = J)
+```
+
+
+```{r occupancy - with covariates}
+## Occupancy -- with covariates
+# create the unmarkedFrame object - with covariates
+gridIDs <- as.numeric(str_split_i(rownames(camop), "_", 3))
+rowIDs <- sapply(1:length(gridIDs), function(i) which(gridIDs[i] == sitecovs$Id))
+umf <- lapply(dethist, unmarkedFrameOccu, siteCovs = sitecovs[rowIDs,], obsCovs = obscovs)
+
+# model fitting - and model selection
+# e.g. wild boar
+umf_wb <- umf$`Sus scrofa`
+
+# step 1: detection models
+fl1 <- fitList(
+  null = occu(~1~1, umf_wb),
+  jul = occu(~scale(jul)~1, umf_wb)
+)
+
+modSel(fl1)
+
+# step 2: occupancy models
+fl2 <- fitList(
+  null = occu(~1~1, umf_wb),
+  pct_broadlv = occu(~1~scale(pct_broadlv), umf_wb),
+  dist_urban = occu(~1~scale(dist_urban), umf_wb),
+  add = occu(~1~scale(pct_broadlv) + scale(dist_urban), umf_wb),
+  mult = occu(~1~scale(pct_broadlv) * scale(dist_urban), umf_wb)
+)
+
+modSel(fl2)
+
+# make predictions for a single top-ranked model
+mod <- fl2@fits$add
+pred_occ <- cbind(
+  select(sitecovs, Id, pct_broadlv, dist_urban),
+  predict(fl2@fits$add, newdata = sitecovs, type = "state")
+)
+
+ggplot(left_join(grid, pred_occ, "Id")) + geom_sf(aes(fill = Predicted))
+
+# make predictions for a set of top-ranked models
+predAvg_occ <- cbind(
+  select(sitecovs, Id, pct_broadlv, dist_urban),
+  modavgPred(fl2@fits[c("add", "pct_broadlv", "mult")], 
+             newdata = sitecovs, type = "response", parm.type = "psi")
+)
+
+ggplot(left_join(grid, predAvg_occ, "Id")) + geom_sf(aes(fill = mod.avg.pred))
+
+# alternative option: use automatic model selection (MuMIn::dredge)
+```
+
+```{r random encounter model - DEMO}
+## Random Encounter model -- DEMO: the data to preform this analysis will
+## not be available to you
+
+# import the CT data
+GMU8 <- camtraptor::read_camtrap_dp("FilesGMU8/datapackage.json")
+
+# pre-process the data
+GMU8$data$deployments <- GMU8$data$deployments %>% 
+  mutate(var = locationName) %>%
+  separate(var, 
+           into = c("year_loc",
+                    "serie",
+                    "gridcell"),
+           "_") %>%
+  filter(serie %in% 9:11,
+         year_loc == 2023) %>%  
+  mutate(tags = case_when(tags == "IJsevallei" ~ "Dijlevallei",
+                          tags == "Laanvallei" ~ "Dijlevallei",
+                          tags == "Egenhovenbos" ~ "Heverleebos",
+                          TRUE ~ tags))
+
+depIDs <- GMU8$data$deployments %>% pull(deploymentID)
+GMU8$data$observations <- GMU8$data$observations %>%
+  filter(deploymentID %in% depIDs)
+GMU8$data$media <- GMU8$data$media %>%
+  filter(deploymentID %in% depIDs)
+
+# remove deployments with errors, or that were not calibrated
+GMU8 <- GMU8 %>%
+  subset_deployments(deploymentID != "f91f2a85-2828-4246-a7c0-c759d393c67d") %>% 
+  subset_deployments(deploymentID != "07446cf5-445a-4d64-a824-183109a88c6c") %>%
+  subset_deployments(locationName != "2022_9_852") %>%
+  subset_deployments(locationName != "2022_9_1620") %>%
+  subset_deployments(deploymentID != "e567d536-db87-4be3-a820-be74cfdef7f2") %>%
+  subset_deployments(locationName != "2022_9_1815") %>%
+  subset_deployments(locationName != "2022_8_851") %>%
+  subset_deployments(locationName != "2022_9_851")
+
+# fit REM + store results
+rem_est <- lapply(my_species, function(s) {
+  rem_estimate(GMU8, species = s, check_deployments = F)
+})
+names(rem_est) <- my_species
+
+rem_results <- rbindlist(lapply(my_species, function(s) {
+  out <- rem_est[[s]]$estimates
+  out <- out %>% mutate(variable = rownames(out)) %>% select(variable, everything())
+  return(out)
+}), idcol = "species")
+rem_results$species <- my_species[rem_results$species]
+
+# plot densities
+rem_results %>% 
+  filter(variable == "density") %>%
+  mutate(species = name_converter[species]) %>%
+  ggplot(aes(x = species, col = species, y = estimate, ymin = lcl95, ymax = ucl95)) +
+  geom_point() + geom_errorbar() +
+  labs(y = expression(paste("Density (ind/", km^2, ")"))) +
+  theme_classic() 
+  # + theme(
+  #   legend.position = "none",
+  #   axis.title = element_text(size = 14),
+  #   axis.text.y = element_text(size = 11),
+  #   axis.text.x = element_text(size = 13),
+  #   legend.title = element_text(size = 13),
+  #   legend.text = element_text(size = 13))
+
+# ggsave("Figures/density.png", width = 16, height = 12, units = "cm", dpi = 300)
+```
+
